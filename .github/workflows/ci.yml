@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ruff
+      - run: ruff check src/ tests/
+      - run: ruff format --check src/ tests/
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[dev]"
+      - run: mypy src/
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: aumos
+          POSTGRES_PASSWORD: aumos_dev
+          POSTGRES_DB: aumos_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      keycloak:
+        image: quay.io/keycloak/keycloak:24.0
+        env:
+          KEYCLOAK_ADMIN: admin
+          KEYCLOAK_ADMIN_PASSWORD: admin
+        ports:
+          - 8080:8080
+        options: >-
+          --health-cmd "curl -f http://localhost:8080/health/ready || exit 1"
+          --health-interval 15s
+          --health-timeout 5s
+          --health-retries 10
+      opa:
+        image: openpolicyagent/opa:0.63.0
+        ports:
+          - 8181:8181
+        options: >-
+          --health-cmd "wget -qO- http://localhost:8181/health || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[dev]"
+      - run: pytest tests/ -v --cov --cov-report=xml
+        env:
+          AUMOS_DATABASE__URL: postgresql+asyncpg://aumos:aumos_dev@localhost:5432/aumos_test
+          AUMOS_AUTH_KEYCLOAK_BASE_URL: http://localhost:8080
+          AUMOS_AUTH_OPA_BASE_URL: http://localhost:8181
+          AUMOS_ENVIRONMENT: test
+      - uses: codecov/codecov-action@v4
+        with:
+          file: coverage.xml
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t test-build .
+
+  license-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pip-licenses
+      - run: |
+          pip install -e .
+          pip-licenses --fail-on="GPL;AGPL" --allow-only="MIT;BSD;Apache Software License;ISC;PSF;MPL 2.0"
