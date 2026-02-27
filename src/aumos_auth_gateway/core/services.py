@@ -9,6 +9,7 @@ Contains three services:
 import secrets
 import time
 import uuid
+from datetime import datetime
 from typing import Any
 
 import bcrypt
@@ -34,11 +35,15 @@ from aumos_auth_gateway.api.schemas import (
     UserInfoResponse,
 )
 from aumos_auth_gateway.core.interfaces import (
+    IAgentPrivilegeAuditor,
     IAgentRepository,
     IAuthEventPublisher,
+    IEnterpriseIdPFederation,
     IKeycloakClient,
+    IMFAEngine,
     IOPAClient,
     IPolicyEvaluationRepository,
+    ISAMLAdapter,
 )
 from aumos_auth_gateway.core.models import AgentStatus, PrivilegeLevel
 
@@ -673,3 +678,587 @@ class TenantIAMService:
             user_id=user_id,
             role=request.role,
         )
+
+
+class MFAService:
+    """Orchestrates multi-factor authentication flows for users and agents.
+
+    Wraps the MFAEngine adapter to provide TOTP provisioning, OTP dispatch
+    and validation, and recovery code management. Also applies MFA policy
+    (service accounts bypass MFA; high-privilege agents always require it).
+
+    Args:
+        mfa_engine: MFA adapter implementing IMFAEngine.
+        hitl_required_level: Agents at or above this level always require MFA.
+    """
+
+    def __init__(
+        self,
+        mfa_engine: IMFAEngine,
+        hitl_required_level: int = 4,
+    ) -> None:
+        self._mfa = mfa_engine
+        self._hitl_level = hitl_required_level
+
+    async def enroll_totp(
+        self,
+        user_id: str,
+        tenant: TenantContext,
+        issuer: str | None = None,
+    ) -> dict[str, Any]:
+        """Start TOTP enrollment for a user or agent.
+
+        Args:
+            user_id: The user or agent identifier.
+            tenant: Authenticated tenant context.
+            issuer: Authenticator app issuer label (defaults to AumOS).
+
+        Returns:
+            Dict with secret_b32, otpauth_uri, and qr_code_uri for display.
+        """
+        effective_issuer = issuer or f"AumOS ({tenant.tenant_id})"
+        logger.info(
+            "TOTP enrollment started",
+            user_id=user_id,
+            tenant_id=str(tenant.tenant_id),
+        )
+        return await self._mfa.provision_totp(
+            user_id=user_id,
+            tenant_id=tenant.tenant_id,
+            issuer=effective_issuer,
+        )
+
+    async def confirm_totp_enrollment(
+        self,
+        user_id: str,
+        tenant: TenantContext,
+        totp_code: str,
+    ) -> bool:
+        """Confirm TOTP enrollment by validating the user's first code.
+
+        Args:
+            user_id: The user or agent identifier.
+            tenant: Authenticated tenant context.
+            totp_code: 6-digit code from the authenticator app.
+
+        Returns:
+            True if enrollment is confirmed successfully.
+        """
+        confirmed = await self._mfa.confirm_totp_enrollment(
+            user_id=user_id,
+            tenant_id=tenant.tenant_id,
+            totp_code=totp_code,
+        )
+        if confirmed:
+            logger.info(
+                "TOTP enrollment confirmed",
+                user_id=user_id,
+                tenant_id=str(tenant.tenant_id),
+            )
+        else:
+            logger.warning(
+                "TOTP enrollment confirmation failed — invalid code",
+                user_id=user_id,
+                tenant_id=str(tenant.tenant_id),
+            )
+        return confirmed
+
+    async def validate_mfa(
+        self,
+        user_id: str,
+        tenant: TenantContext,
+        mfa_method: str,
+        code: str,
+        otp_id: str | None = None,
+    ) -> bool:
+        """Validate an MFA credential for a user or agent.
+
+        Dispatches to the appropriate validation method based on ``mfa_method``:
+        - "totp": TOTP RFC 6238 validation
+        - "sms" / "email": OTP code validation using ``otp_id``
+        - "recovery": Backup recovery code consumption
+
+        Args:
+            user_id: The user or agent identifier.
+            tenant: Authenticated tenant context.
+            mfa_method: One of "totp", "sms", "email", "recovery".
+            code: The submitted MFA code.
+            otp_id: Required for "sms" and "email" methods (record ID).
+
+        Returns:
+            True if the MFA challenge is satisfied.
+
+        Raises:
+            AumOSError: If ``mfa_method`` is not recognised.
+        """
+        if mfa_method == "totp":
+            return await self._mfa.validate_totp(
+                user_id=user_id,
+                tenant_id=tenant.tenant_id,
+                totp_code=code,
+            )
+        elif mfa_method in ("sms", "email"):
+            if not otp_id:
+                raise AumOSError(
+                    message=f"otp_id is required for {mfa_method} MFA method",
+                    error_code=ErrorCode.VALIDATION_ERROR,
+                )
+            return await self._mfa.validate_otp(otp_id=otp_id, code=code)
+        elif mfa_method == "recovery":
+            return await self._mfa.validate_recovery_code(
+                user_id=user_id,
+                tenant_id=tenant.tenant_id,
+                code=code,
+            )
+        else:
+            raise AumOSError(
+                message=f"Unknown MFA method: {mfa_method!r}. Use totp, sms, email, or recovery.",
+                error_code=ErrorCode.VALIDATION_ERROR,
+            )
+
+    async def is_mfa_required(self, user_id: str, tenant: TenantContext) -> bool:
+        """Check whether MFA is required before granting access.
+
+        Args:
+            user_id: The user or agent identifier.
+            tenant: Authenticated tenant context.
+
+        Returns:
+            True if the MFA challenge must be completed.
+        """
+        return await self._mfa.is_mfa_required(
+            user_id=user_id,
+            tenant_id=tenant.tenant_id,
+        )
+
+
+class SAMLFederationService:
+    """Manages SAML 2.0 SP-initiated SSO flows for enterprise customers.
+
+    Handles AuthnRequest generation, Response parsing and validation,
+    SP metadata generation, and Single Logout initiation. Delegates all
+    XML and cryptographic operations to the SAMLAdapter.
+
+    Args:
+        saml_adapter: SAML adapter implementing ISAMLAdapter.
+        base_url: Public base URL of the AumOS auth-gateway.
+    """
+
+    def __init__(self, saml_adapter: ISAMLAdapter, base_url: str) -> None:
+        self._saml = saml_adapter
+        self._base_url = base_url
+
+    async def initiate_sso(
+        self,
+        idp_id: str,
+        relay_state: str | None = None,
+        binding: str = "HTTP_REDIRECT",
+    ) -> dict[str, Any]:
+        """Build an AuthnRequest and return the redirect or POST parameters.
+
+        Args:
+            idp_id: Identifier of the target SAML IdP.
+            relay_state: Optional opaque state to carry through the flow.
+            binding: Binding type — "HTTP_REDIRECT" or "HTTP_POST".
+
+        Returns:
+            Dict with redirect_url (HTTP_REDIRECT) or saml_request + action_url
+            (HTTP_POST) for the caller to build the browser response.
+        """
+        logger.info("SAML SSO initiated", idp_id=idp_id, binding=binding)
+        return await self._saml.generate_authn_request(
+            idp_id=idp_id,
+            relay_state=relay_state,
+            binding=binding,
+        )
+
+    async def process_saml_response(
+        self,
+        saml_response_b64: str,
+        relay_state: str | None = None,
+    ) -> dict[str, Any]:
+        """Parse and validate an incoming SAML Response from an IdP.
+
+        Args:
+            saml_response_b64: Base64-encoded SAML Response XML.
+            relay_state: relay_state parameter from the HTTP callback.
+
+        Returns:
+            Parsed assertion dict with name_id, attributes, session_index.
+
+        Raises:
+            AumOSError: If the response is invalid, expired, or lacks a valid
+                signature.
+        """
+        assertion = await self._saml.parse_saml_response(
+            saml_response_b64=saml_response_b64,
+            relay_state=relay_state,
+        )
+        logger.info(
+            "SAML response processed",
+            name_id=assertion.get("name_id", ""),
+            issuer=assertion.get("issuer", ""),
+        )
+        return assertion
+
+    async def get_sp_metadata(self) -> str:
+        """Generate AumOS SP metadata XML for registration with an IdP.
+
+        Returns:
+            SP metadata XML string.
+        """
+        return await self._saml.generate_sp_metadata(base_url=self._base_url)
+
+    async def initiate_slo(
+        self,
+        idp_id: str,
+        name_id: str,
+        session_index: str | None = None,
+    ) -> dict[str, Any]:
+        """Build a Single Logout request for the given SAML session.
+
+        Args:
+            idp_id: Identifier of the target SAML IdP.
+            name_id: NameID from the original SAML assertion.
+            session_index: Session index from the original assertion.
+
+        Returns:
+            Dict with redirect parameters for the SLO request.
+        """
+        logger.info("SAML SLO initiated", idp_id=idp_id, name_id=name_id)
+        return await self._saml.generate_slo_request(
+            idp_id=idp_id,
+            name_id=name_id,
+            session_index=session_index,
+        )
+
+
+class EnterpriseIdPService:
+    """Manages enterprise OIDC Identity Provider federation and JIT provisioning.
+
+    Handles IdP registration, email-domain-based routing, Authorization Code
+    flow, and JIT user provisioning. Wraps the EnterpriseIdPFederation adapter
+    with business-level validation and logging.
+
+    Args:
+        idp_federation: Federation adapter implementing IEnterpriseIdPFederation.
+        event_publisher: Kafka publisher for auth domain events.
+    """
+
+    def __init__(
+        self,
+        idp_federation: IEnterpriseIdPFederation,
+        event_publisher: IAuthEventPublisher,
+    ) -> None:
+        self._federation = idp_federation
+        self._publisher = event_publisher
+
+    async def register_enterprise_idp(
+        self,
+        idp_id: str,
+        config: dict[str, Any],
+        correlation_id: str | None = None,
+    ) -> None:
+        """Register a new enterprise OIDC IdP.
+
+        Args:
+            idp_id: Unique identifier for the IdP (e.g., "okta-acme").
+            config: IdP configuration (discovery_url, client_id, client_secret,
+                email_domains, attribute_mappings, jit_enabled).
+            correlation_id: Request correlation identifier.
+
+        Raises:
+            AumOSError: If required config fields are missing.
+        """
+        required_fields = {"discovery_url", "client_id", "client_secret", "email_domains"}
+        missing = required_fields - set(config.keys())
+        if missing:
+            raise AumOSError(
+                message=f"Missing required IdP config fields: {sorted(missing)}",
+                error_code=ErrorCode.VALIDATION_ERROR,
+            )
+        await self._federation.register_idp(idp_id=idp_id, config=config)
+        logger.info(
+            "Enterprise IdP registered",
+            idp_id=idp_id,
+            email_domains=config.get("email_domains", []),
+            correlation_id=correlation_id,
+        )
+
+    async def resolve_idp_for_email(self, email: str) -> str:
+        """Route a user email to the correct enterprise IdP.
+
+        Args:
+            email: User email address.
+
+        Returns:
+            The idp_id to use for this user's authentication flow.
+
+        Raises:
+            AumOSError: If no IdP is registered for the email domain.
+        """
+        idp_id = await self._federation.route_to_idp(email=email)
+        if idp_id is None:
+            domain = email.split("@")[-1] if "@" in email else email
+            raise AumOSError(
+                message=f"No enterprise IdP registered for domain '{domain}'",
+                error_code=ErrorCode.NOT_FOUND,
+            )
+        return idp_id
+
+    async def start_authorization_flow(
+        self,
+        idp_id: str,
+        redirect_uri: str,
+        state: str,
+        nonce: str | None = None,
+        scopes: list[str] | None = None,
+    ) -> str:
+        """Build an OIDC Authorization Code flow URL for an enterprise IdP.
+
+        Args:
+            idp_id: Identifier of the enterprise IdP.
+            redirect_uri: OAuth callback URI.
+            state: CSRF state parameter.
+            nonce: Optional ID token nonce.
+            scopes: Requested scopes (defaults to openid profile email).
+
+        Returns:
+            Full authorization URL string to redirect the user's browser to.
+        """
+        return await self._federation.build_authorization_url(
+            idp_id=idp_id,
+            redirect_uri=redirect_uri,
+            state=state,
+            nonce=nonce,
+            scopes=scopes or ["openid", "profile", "email"],
+        )
+
+    async def complete_authorization_flow(
+        self,
+        idp_id: str,
+        code: str,
+        redirect_uri: str,
+        code_verifier: str | None = None,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Complete an OIDC Authorization Code flow and JIT-provision the user.
+
+        Exchanges the code for tokens, fetches UserInfo, then provisions or
+        updates the user account via JIT provisioning.
+
+        Args:
+            idp_id: Identifier of the enterprise IdP.
+            code: Authorization code from the IdP callback.
+            redirect_uri: Redirect URI used in the initial request.
+            code_verifier: PKCE code verifier if applicable.
+            correlation_id: Request correlation identifier.
+
+        Returns:
+            Dict with provisioned user fields and token data.
+        """
+        correlation_id = correlation_id or str(uuid.uuid4())
+
+        tokens = await self._federation.exchange_code_for_tokens(
+            idp_id=idp_id,
+            code=code,
+            redirect_uri=redirect_uri,
+            code_verifier=code_verifier,
+        )
+
+        # Decode ID token claims (already validated by the adapter)
+        id_token_claims = tokens.get("id_token_claims", {})
+
+        # Fetch UserInfo for authoritative attribute data
+        userinfo: dict[str, Any] = {}
+        if tokens.get("access_token"):
+            try:
+                userinfo = await self._federation.provision_user_jit(
+                    idp_id=idp_id,
+                    id_token_claims=id_token_claims,
+                    userinfo=userinfo,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "JIT provisioning encountered non-fatal error",
+                    idp_id=idp_id,
+                    error=str(exc),
+                    correlation_id=correlation_id,
+                )
+
+        logger.info(
+            "Enterprise OIDC flow completed",
+            idp_id=idp_id,
+            user_email=id_token_claims.get("email", ""),
+            correlation_id=correlation_id,
+        )
+        return {"tokens": tokens, "user": userinfo}
+
+
+class PrivilegeAuditService:
+    """Coordinates agent privilege auditing across tenants.
+
+    Provides a service-layer wrapper around the AgentPrivilegeAuditor adapter
+    that applies tenant scoping and orchestrates audit reporting workflows.
+
+    Args:
+        auditor: Privilege auditor adapter implementing IAgentPrivilegeAuditor.
+    """
+
+    def __init__(self, auditor: IAgentPrivilegeAuditor) -> None:
+        self._auditor = auditor
+
+    async def record_privilege_usage(
+        self,
+        agent_id: uuid.UUID,
+        tenant: TenantContext,
+        privilege_level_used: int,
+        configured_privilege_level: int,
+        resource: str,
+        action: str,
+        granted: bool,
+        ip_address: str | None = None,
+        correlation_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Record an agent privilege usage event (fire-and-forget wrapper).
+
+        Designed to be called from API middleware or policy evaluation hooks.
+        Errors are caught and logged rather than propagated so that audit
+        failures never block the primary auth flow.
+
+        Args:
+            agent_id: UUID of the acting agent.
+            tenant: Authenticated tenant context.
+            privilege_level_used: Privilege level exercised (1-5).
+            configured_privilege_level: Agent's assigned maximum level (1-5).
+            resource: Resource URN or path.
+            action: Action category.
+            granted: Whether access was granted.
+            ip_address: Optional caller IP.
+            correlation_id: Optional request correlation ID.
+            metadata: Optional additional context.
+        """
+        try:
+            await self._auditor.record_usage(
+                agent_id=agent_id,
+                tenant_id=tenant.tenant_id,
+                privilege_level_used=privilege_level_used,
+                configured_privilege_level=configured_privilege_level,
+                resource=resource,
+                action=action,
+                granted=granted,
+                ip_address=ip_address,
+                correlation_id=correlation_id,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to record privilege usage event",
+                agent_id=str(agent_id),
+                tenant_id=str(tenant.tenant_id),
+                error=str(exc),
+            )
+
+    async def get_tenant_escalation_alerts(
+        self,
+        tenant: TenantContext,
+        since: datetime | None = None,
+        agent_id: uuid.UUID | None = None,
+    ) -> list[Any]:
+        """Retrieve privilege escalation alerts for a tenant.
+
+        Args:
+            tenant: Authenticated tenant context.
+            since: Optional timestamp filter.
+            agent_id: Optional agent filter.
+
+        Returns:
+            List of EscalationAlert records.
+        """
+        return await self._auditor.get_escalation_alerts(
+            tenant_id=tenant.tenant_id,
+            since=since,
+            agent_id=agent_id,
+        )
+
+    async def get_tenant_analytics(
+        self,
+        tenant: TenantContext,
+        agent_id: uuid.UUID | None = None,
+        since: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Return aggregated privilege analytics for a tenant.
+
+        Args:
+            tenant: Authenticated tenant context.
+            agent_id: Optional agent filter.
+            since: Optional start of the analytics window.
+
+        Returns:
+            Analytics dict from AgentPrivilegeAuditor.
+        """
+        return await self._auditor.get_usage_analytics(
+            tenant_id=tenant.tenant_id,
+            agent_id=agent_id,
+            since=since,
+        )
+
+    async def get_dormant_agents(
+        self,
+        tenant: TenantContext,
+        threshold_days: int = 30,
+    ) -> list[Any]:
+        """Identify dormant agents in a tenant.
+
+        Args:
+            tenant: Authenticated tenant context.
+            threshold_days: Inactivity threshold in days.
+
+        Returns:
+            List of AgentPrivilegeSummary for dormant agents.
+        """
+        return await self._auditor.get_dormant_agents(
+            tenant_id=tenant.tenant_id,
+            threshold_days=threshold_days,
+        )
+
+    async def run_access_review(self, tenant: TenantContext) -> list[Any]:
+        """Generate prioritised access review entries for a tenant.
+
+        Args:
+            tenant: Authenticated tenant context.
+
+        Returns:
+            List of AccessReviewEntry sorted by risk_score descending.
+        """
+        return await self._auditor.get_access_review_data(tenant_id=tenant.tenant_id)
+
+    async def generate_privilege_report(
+        self,
+        tenant: TenantContext,
+        period_start: datetime | None = None,
+        period_end: datetime | None = None,
+    ) -> Any:
+        """Generate a full privilege audit report for a tenant.
+
+        Args:
+            tenant: Authenticated tenant context.
+            period_start: Optional start of the audit period.
+            period_end: Optional end of the audit period.
+
+        Returns:
+            PrivilegeAuditReport with summaries, alerts, and review entries.
+        """
+        report = await self._auditor.generate_report(
+            tenant_id=tenant.tenant_id,
+            period_start=period_start,
+            period_end=period_end,
+        )
+        logger.info(
+            "Privilege audit report generated via service",
+            tenant_id=str(tenant.tenant_id),
+            period_start=period_start.isoformat() if period_start else None,
+            period_end=period_end.isoformat() if period_end else None,
+        )
+        return report
