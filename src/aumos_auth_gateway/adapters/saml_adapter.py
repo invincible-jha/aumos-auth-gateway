@@ -175,6 +175,7 @@ class SAMLAdapter:
         issue_instant = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         idp_sso_url = self._idp_metadata.sso_url if self._idp_metadata else ""
+        force_authn_attr = ' ForceAuthn="true"' if force_authn else ""
 
         authn_request_xml = (
             f'<samlp:AuthnRequest xmlns:samlp="{_NS_SAMLP}" xmlns:saml="{_NS_SAML}"'
@@ -184,7 +185,7 @@ class SAMLAdapter:
             f' Destination="{idp_sso_url}"'
             f' AssertionConsumerServiceURL="{self._sp_acs_url}"'
             f' ProtocolBinding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"'
-            f'{" ForceAuthn=\"true\"" if force_authn else ""}>'
+            f'{force_authn_attr}>'
             f'<saml:Issuer>{self._sp_entity_id}</saml:Issuer>'
             f'<samlp:NameIDPolicy Format="{name_id_policy}" AllowCreate="true"/>'
             f"</samlp:AuthnRequest>"
