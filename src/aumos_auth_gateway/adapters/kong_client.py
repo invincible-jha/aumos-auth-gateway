@@ -314,6 +314,81 @@ class KongAdminClient:
                 return config
         return {}
 
+    async def set_consumer_rate_limit(
+        self,
+        consumer_id: str,
+        requests_per_minute: int,
+        requests_per_hour: int | None = None,
+        requests_per_day: int | None = None,
+    ) -> dict[str, Any]:
+        """Apply a per-consumer rate-limiting plugin to an agent's Kong consumer.
+
+        Gap #22: Rate limiting per agent — sets consumer-level rate limits via
+        the Kong rate-limiting plugin attached to the specific consumer entity.
+
+        Args:
+            consumer_id: Kong consumer username or UUID (typically the agent UUID string).
+            requests_per_minute: Maximum requests allowed per minute.
+            requests_per_hour: Optional maximum requests per hour.
+            requests_per_day: Optional maximum requests per day.
+
+        Returns:
+            Created or updated plugin object dict.
+
+        Raises:
+            AumOSError: If Kong is unreachable or the plugin cannot be applied.
+        """
+        config: dict[str, Any] = {
+            "minute": requests_per_minute,
+            "policy": "local",
+        }
+        if requests_per_hour is not None:
+            config["hour"] = requests_per_hour
+        if requests_per_day is not None:
+            config["day"] = requests_per_day
+
+        payload: dict[str, Any] = {
+            "name": "rate-limiting",
+            "consumer": {"id": consumer_id},
+            "config": config,
+        }
+
+        try:
+            response = await self._http.post("/plugins", json=payload)
+        except httpx.ConnectError as exc:
+            raise AumOSError(
+                message="Kong Admin API unreachable during rate-limit plugin creation",
+                error_code=ErrorCode.SERVICE_UNAVAILABLE,
+            ) from exc
+
+        if response.status_code in (200, 201):
+            result: dict[str, Any] = response.json()
+            logger.info(
+                "Kong consumer rate limit set",
+                consumer_id=consumer_id,
+                requests_per_minute=requests_per_minute,
+            )
+            return result
+
+        if response.status_code == 409:
+            # Plugin already exists — update it via PATCH
+            existing_response = await self._http.get(f"/consumers/{consumer_id}/plugins")
+            if existing_response.status_code == 200:
+                plugins_data: dict[str, Any] = existing_response.json()
+                plugins_list: list[dict[str, Any]] = plugins_data.get("data", [])
+                for plugin in plugins_list:
+                    if plugin.get("name") == "rate-limiting":
+                        plugin_id: str = plugin["id"]
+                        patch_response = await self._http.patch(f"/plugins/{plugin_id}", json={"config": config})
+                        if patch_response.status_code == 200:
+                            patched: dict[str, Any] = patch_response.json()
+                            return patched
+
+        raise AumOSError(
+            message=f"Failed to set rate limit for consumer '{consumer_id}': {response.status_code} {response.text[:200]}",
+            error_code=ErrorCode.INTERNAL_ERROR,
+        )
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
