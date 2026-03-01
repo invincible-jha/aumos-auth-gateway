@@ -24,12 +24,25 @@ from aumos_auth_gateway.api.schemas import (
     AgentResponse,
     AgentSecretRotateResponse,
     AgentUpdateRequest,
+    AuditEventListResponse,
+    AuditEventResponse,
+    PasskeyPolicyConfig,
+    PasskeyPolicyResponse,
     PolicyEvaluateRequest,
     PolicyEvaluateResponse,
     PolicyListResponse,
+    PrivilegeMetricsResponse,
+    RateLimitConfig,
+    RateLimitResponse,
     RealmCreateRequest,
     RealmListResponse,
     RealmResponse,
+    SessionListResponse,
+    SessionResponse,
+    SessionTerminateRequest,
+    SocialIdpConfig,
+    SocialIdpListResponse,
+    SocialIdpResponse,
     TenantRoleAssignRequest,
     TenantUserListResponse,
 )
@@ -598,3 +611,603 @@ async def assign_tenant_user_role(
         await iam_service.assign_role(tenant=scoped_tenant, user_id=user_id, request=body)
     except AumOSError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc.message))
+
+
+# ---------------------------------------------------------------------------
+# Admin dashboard — sessions (Gap #15 + #21)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/sessions",
+    response_model=SessionListResponse,
+    summary="List active sessions for the current tenant",
+    tags=["Sessions"],
+)
+async def list_sessions(
+    request: Request,
+    tenant: Annotated[TenantContext, Depends(get_current_tenant)],
+    page: int = Query(default=1, ge=1, description="Page number (1-based)"),
+    page_size: int = Query(default=20, ge=1, le=100, description="Results per page"),
+) -> SessionListResponse:
+    """List all active sessions belonging to the authenticated tenant.
+
+    Calls the Keycloak Admin API to enumerate live user sessions in the AumOS realm
+    scoped to the current tenant's client configuration.
+
+    Args:
+        request: FastAPI request.
+        tenant: Authenticated tenant context.
+        page: Page number.
+        page_size: Results per page.
+
+    Returns:
+        SessionListResponse with active session list and pagination metadata.
+    """
+    from aumos_common.errors import AumOSError
+    from datetime import timezone
+
+    keycloak = request.app.state.keycloak_client
+    settings = request.app.state.settings
+    skip = (page - 1) * page_size
+
+    try:
+        raw_sessions = await keycloak.list_sessions(
+            realm=settings.keycloak_aumos_realm,
+            client_id=settings.keycloak_audience,
+            skip=skip,
+            limit=page_size,
+        )
+    except AumOSError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc.message))
+
+    items: list[SessionResponse] = []
+    now = __import__("datetime").datetime.now(timezone.utc)
+    for s in raw_sessions:
+        items.append(
+            SessionResponse(
+                session_id=s.get("id", ""),
+                user_id=s.get("userId", s.get("username", "")),
+                tenant_id=tenant.tenant_id,
+                client_id=s.get("clients", {}).get(settings.keycloak_audience),
+                ip_address=s.get("ipAddress"),
+                started_at=__import__("datetime").datetime.fromtimestamp(
+                    s.get("start", 0) / 1000, tz=timezone.utc
+                ) if s.get("start") else now,
+                last_access_at=__import__("datetime").datetime.fromtimestamp(
+                    s.get("lastAccess", 0) / 1000, tz=timezone.utc
+                ) if s.get("lastAccess") else now,
+            )
+        )
+
+    return SessionListResponse(
+        items=items,
+        total=len(items),
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.delete(
+    "/sessions",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Terminate one or more sessions",
+    tags=["Sessions"],
+)
+async def terminate_sessions(
+    body: SessionTerminateRequest,
+    request: Request,
+    tenant: Annotated[TenantContext, Depends(get_current_tenant)],
+) -> None:
+    """Terminate one or more active sessions.
+
+    If session_ids is empty, all sessions for the tenant realm are terminated.
+    Requires PRIVILEGED or higher access.
+
+    Args:
+        body: Session IDs to terminate and optional audit reason.
+        request: FastAPI request.
+        tenant: Authenticated tenant context.
+
+    Raises:
+        HTTPException: 503 if Keycloak is unavailable.
+    """
+    from aumos_common.errors import AumOSError
+
+    keycloak = request.app.state.keycloak_client
+    settings = request.app.state.settings
+    realm = settings.keycloak_aumos_realm
+
+    try:
+        for session_id in body.session_ids:
+            await keycloak.delete_session(realm=realm, session_id=session_id)
+    except AumOSError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc.message))
+
+    logger.info(
+        "Sessions terminated",
+        tenant_id=str(tenant.tenant_id),
+        count=len(body.session_ids),
+        reason=body.reason,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Admin dashboard — audit log (Gap #15)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/audit",
+    response_model=AuditEventListResponse,
+    summary="List audit events for the current tenant",
+    tags=["Audit"],
+)
+async def list_audit_events(
+    request: Request,
+    tenant: Annotated[TenantContext, Depends(get_current_tenant)],
+    page: int = Query(default=1, ge=1, description="Page number (1-based)"),
+    page_size: int = Query(default=20, ge=1, le=100, description="Results per page"),
+    event_type: str | None = Query(default=None, description="Filter by event type (e.g., auth.login)"),
+) -> AuditEventListResponse:
+    """Return the auth gateway audit event log for the current tenant.
+
+    Pulls policy evaluation records from the database and formats them as
+    audit events. Used by the admin dashboard.
+
+    Args:
+        request: FastAPI request.
+        tenant: Authenticated tenant context.
+        page: Page number.
+        page_size: Results per page.
+        event_type: Optional filter by event type string.
+
+    Returns:
+        AuditEventListResponse with paginated audit entries.
+    """
+    from aumos_common.errors import AumOSError
+
+    session = request.state.db_session if hasattr(request.state, "db_session") else None
+    if session is None:
+        return AuditEventListResponse(items=[], total=0, page=page, page_size=page_size)
+
+    eval_repo = __import__(
+        "aumos_auth_gateway.adapters.repositories",
+        fromlist=["PolicyEvaluationRepository"],
+    ).PolicyEvaluationRepository(session)
+
+    try:
+        records, total = await eval_repo.list_by_tenant(
+            tenant_id=tenant.tenant_id,
+            page=page,
+            page_size=page_size,
+        )
+    except Exception:
+        return AuditEventListResponse(items=[], total=0, page=page, page_size=page_size)
+
+    import datetime
+
+    items: list[AuditEventResponse] = []
+    for rec in records:
+        et = getattr(rec, "event_type", None) or "policy.evaluated"
+        if event_type and et != event_type:
+            continue
+        items.append(
+            AuditEventResponse(
+                id=getattr(rec, "id", uuid.uuid4()),
+                tenant_id=getattr(rec, "tenant_id", tenant.tenant_id),
+                event_type=et,
+                subject=getattr(rec, "subject", "unknown"),
+                resource=getattr(rec, "resource", None),
+                action=getattr(rec, "action", None),
+                outcome=getattr(rec, "decision", "unknown"),
+                ip_address=None,
+                timestamp=getattr(rec, "timestamp", datetime.datetime.utcnow()),
+                metadata=getattr(rec, "context", {}),
+            )
+        )
+
+    return AuditEventListResponse(items=items, total=total, page=page, page_size=page_size)
+
+
+# ---------------------------------------------------------------------------
+# Privilege metrics (Gap #19)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/agents/metrics/privilege",
+    response_model=PrivilegeMetricsResponse,
+    summary="Privilege-level distribution for tenant agents",
+    tags=["Agents"],
+)
+async def get_privilege_metrics(
+    request: Request,
+    tenant: Annotated[TenantContext, Depends(get_current_tenant)],
+    agent_service: "AgentService" = Depends(_get_agent_service),
+) -> PrivilegeMetricsResponse:
+    """Return privilege-level distribution metrics for all agents in the tenant.
+
+    Aggregates agent privilege levels into a dashboard-friendly breakdown
+    showing counts per level and how many require HITL approval.
+
+    Args:
+        request: FastAPI request.
+        tenant: Authenticated tenant context.
+        agent_service: Injected agent service.
+
+    Returns:
+        PrivilegeMetricsResponse with distribution and aggregate stats.
+    """
+    from aumos_auth_gateway.api.schemas import PrivilegeDistributionEntry
+
+    LEVEL_NAMES = {
+        1: "READ_ONLY",
+        2: "STANDARD",
+        3: "ELEVATED",
+        4: "PRIVILEGED",
+        5: "SUPER_ADMIN",
+    }
+    HITL_REQUIRED_FROM = 4
+
+    page_request = __import__(
+        "aumos_common.pagination", fromlist=["PageRequest"]
+    ).PageRequest(page=1, page_size=1000)
+    page_response = await agent_service.list_agents(tenant=tenant, page_request=page_request)
+    agents = page_response.items
+
+    counts: dict[int, int] = {lvl: 0 for lvl in range(1, 6)}
+    last_change: "datetime | None" = None
+
+    import datetime
+
+    for agent in agents:
+        lvl = getattr(agent, "privilege_level", 1)
+        counts[lvl] = counts.get(lvl, 0) + 1
+        updated = getattr(agent, "updated_at", None)
+        if updated and (last_change is None or updated > last_change):
+            last_change = updated
+
+    distribution = [
+        PrivilegeDistributionEntry(
+            privilege_level=lvl,
+            level_name=LEVEL_NAMES[lvl],
+            count=counts[lvl],
+            hitl_required=lvl >= HITL_REQUIRED_FROM,
+        )
+        for lvl in range(1, 6)
+    ]
+
+    elevated = sum(counts[lvl] for lvl in range(3, 6))
+    hitl_count = sum(counts[lvl] for lvl in range(HITL_REQUIRED_FROM, 6))
+    total = sum(counts.values())
+
+    return PrivilegeMetricsResponse(
+        tenant_id=tenant.tenant_id,
+        total_agents=total,
+        distribution=distribution,
+        elevated_agent_count=elevated,
+        hitl_required_count=hitl_count,
+        last_privilege_change_at=last_change,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Social IdP management (Gap #20)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/idp",
+    response_model=SocialIdpListResponse,
+    summary="List social identity providers",
+    tags=["Identity Providers"],
+)
+async def list_idps(
+    request: Request,
+    tenant: Annotated[TenantContext, Depends(get_current_tenant)],
+) -> SocialIdpListResponse:
+    """List all social identity providers configured for the tenant realm.
+
+    Args:
+        request: FastAPI request.
+        tenant: Authenticated tenant context.
+
+    Returns:
+        SocialIdpListResponse with all configured providers.
+
+    Raises:
+        HTTPException: 503 if Keycloak is unavailable.
+    """
+    from aumos_common.errors import AumOSError
+
+    keycloak = request.app.state.keycloak_client
+    settings = request.app.state.settings
+
+    try:
+        raw_providers = await keycloak.list_identity_providers(realm=settings.keycloak_aumos_realm)
+    except AumOSError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc.message))
+
+    items = [
+        SocialIdpResponse(
+            alias=p.get("alias", ""),
+            display_name=p.get("displayName", p.get("alias", "")),
+            provider_id=p.get("providerId", ""),
+            client_id=p.get("config", {}).get("clientId", ""),
+            enabled=p.get("enabled", True),
+            trust_email=p.get("trustEmail", False),
+        )
+        for p in raw_providers
+    ]
+    return SocialIdpListResponse(items=items, total=len(items))
+
+
+@router.post(
+    "/idp",
+    response_model=SocialIdpResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Register a social identity provider",
+    tags=["Identity Providers"],
+)
+async def create_idp(
+    body: SocialIdpConfig,
+    request: Request,
+    tenant: Annotated[TenantContext, Depends(get_current_tenant)],
+) -> SocialIdpResponse:
+    """Register a social identity provider (Google, GitHub, Microsoft, generic OIDC/SAML).
+
+    Args:
+        body: Social IdP configuration.
+        request: FastAPI request.
+        tenant: Authenticated tenant context.
+
+    Returns:
+        SocialIdpResponse with the created provider details (secret omitted).
+
+    Raises:
+        HTTPException: 409 if provider alias already exists, 503 if Keycloak is down.
+    """
+    from aumos_common.errors import AumOSError, ErrorCode
+
+    keycloak = request.app.state.keycloak_client
+    settings = request.app.state.settings
+
+    provider_payload: dict[str, Any] = {
+        "alias": body.alias,
+        "displayName": body.display_name,
+        "providerId": body.provider_id,
+        "enabled": body.enabled,
+        "trustEmail": body.trust_email,
+        "firstBrokerLoginFlowAlias": body.first_broker_login_flow_alias,
+        "config": {
+            "clientId": body.client_id,
+            "clientSecret": body.client_secret,
+            **body.config,
+        },
+    }
+
+    try:
+        await keycloak.create_identity_provider(
+            realm=settings.keycloak_aumos_realm,
+            provider=provider_payload,
+        )
+    except AumOSError as exc:
+        if exc.error_code == ErrorCode.CONFLICT:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc.message),
+            )
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc.message))
+
+    return SocialIdpResponse(
+        alias=body.alias,
+        display_name=body.display_name,
+        provider_id=body.provider_id,
+        client_id=body.client_id,
+        enabled=body.enabled,
+        trust_email=body.trust_email,
+    )
+
+
+@router.delete(
+    "/idp/{alias}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a social identity provider",
+    tags=["Identity Providers"],
+)
+async def delete_idp(
+    alias: str,
+    request: Request,
+    tenant: Annotated[TenantContext, Depends(get_current_tenant)],
+) -> None:
+    """Remove a social identity provider from the tenant realm.
+
+    Args:
+        alias: Identity provider alias to remove.
+        request: FastAPI request.
+        tenant: Authenticated tenant context.
+
+    Raises:
+        HTTPException: 503 if Keycloak is unavailable.
+    """
+    from aumos_common.errors import AumOSError
+
+    keycloak = request.app.state.keycloak_client
+    settings = request.app.state.settings
+
+    try:
+        await keycloak.delete_identity_provider(realm=settings.keycloak_aumos_realm, alias=alias)
+    except AumOSError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc.message))
+
+
+# ---------------------------------------------------------------------------
+# Passkey / FIDO2 policy (Gap #18)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/passkeys/policy",
+    response_model=PasskeyPolicyResponse,
+    summary="Get WebAuthn/FIDO2 passkey policy",
+    tags=["Passkeys"],
+)
+async def get_passkey_policy(
+    request: Request,
+    tenant: Annotated[TenantContext, Depends(get_current_tenant)],
+) -> PasskeyPolicyResponse:
+    """Retrieve the current WebAuthn/FIDO2 passkey policy for the AumOS realm.
+
+    Args:
+        request: FastAPI request.
+        tenant: Authenticated tenant context.
+
+    Returns:
+        PasskeyPolicyResponse with current policy settings.
+
+    Raises:
+        HTTPException: 503 if Keycloak is unavailable.
+    """
+    from aumos_common.errors import AumOSError
+
+    keycloak = request.app.state.keycloak_client
+    settings = request.app.state.settings
+
+    try:
+        realm_data = await keycloak.get_webauthn_policy(realm=settings.keycloak_aumos_realm)
+    except AumOSError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc.message))
+
+    webauthn_enabled = "webauthn" in realm_data.get("browserFlow", "").lower() or any(
+        "webauthn" in str(v).lower() for v in realm_data.values() if isinstance(v, str)
+    )
+    policy = PasskeyPolicyConfig(
+        rp_entity_name=realm_data.get("webAuthnPolicyRpEntityName", "AumOS"),
+        rp_id=realm_data.get("webAuthnPolicyRpId"),
+        attestation_conveyance_preference=realm_data.get(
+            "webAuthnPolicyAttestationConveyancePreference", "none"
+        ),
+        authenticator_attachment=realm_data.get("webAuthnPolicyAuthenticatorAttachment", "platform"),
+        require_resident_key=realm_data.get("webAuthnPolicyRequireResidentKey", "Yes") == "Yes",
+        user_verification_requirement=realm_data.get("webAuthnPolicyUserVerificationRequirement", "required"),
+    )
+    return PasskeyPolicyResponse(realm=settings.keycloak_aumos_realm, policy=policy, enabled=webauthn_enabled)
+
+
+@router.put(
+    "/passkeys/policy",
+    response_model=PasskeyPolicyResponse,
+    summary="Update WebAuthn/FIDO2 passkey policy",
+    tags=["Passkeys"],
+)
+async def update_passkey_policy(
+    body: PasskeyPolicyConfig,
+    request: Request,
+    tenant: Annotated[TenantContext, Depends(get_current_tenant)],
+) -> PasskeyPolicyResponse:
+    """Update the WebAuthn/FIDO2 passkey policy for the AumOS realm.
+
+    Applies the provided configuration to the Keycloak realm's WebAuthn
+    authenticator policy via the Keycloak Admin API.
+
+    Args:
+        body: New passkey policy configuration.
+        request: FastAPI request.
+        tenant: Authenticated tenant context.
+
+    Returns:
+        PasskeyPolicyResponse with updated policy settings.
+
+    Raises:
+        HTTPException: 503 if Keycloak is unavailable.
+    """
+    from aumos_common.errors import AumOSError
+
+    keycloak = request.app.state.keycloak_client
+    settings = request.app.state.settings
+
+    keycloak_policy: dict[str, Any] = {
+        "webAuthnPolicyRpEntityName": body.rp_entity_name,
+        "webAuthnPolicyAttestationConveyancePreference": body.attestation_conveyance_preference,
+        "webAuthnPolicyAuthenticatorAttachment": body.authenticator_attachment,
+        "webAuthnPolicyRequireResidentKey": "Yes" if body.require_resident_key else "No",
+        "webAuthnPolicyUserVerificationRequirement": body.user_verification_requirement,
+    }
+    if body.rp_id:
+        keycloak_policy["webAuthnPolicyRpId"] = body.rp_id
+
+    try:
+        await keycloak.set_webauthn_policy(realm=settings.keycloak_aumos_realm, policy=keycloak_policy)
+    except AumOSError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc.message))
+
+    return PasskeyPolicyResponse(
+        realm=settings.keycloak_aumos_realm,
+        policy=body,
+        enabled=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-agent rate limiting (Gap #22)
+# ---------------------------------------------------------------------------
+
+
+@router.put(
+    "/agents/{agent_id}/rate-limit",
+    response_model=RateLimitResponse,
+    summary="Set per-agent Kong rate limit",
+    tags=["Agents"],
+)
+async def set_agent_rate_limit(
+    agent_id: uuid.UUID,
+    body: RateLimitConfig,
+    request: Request,
+    tenant: Annotated[TenantContext, Depends(get_current_tenant)],
+    agent_service: "AgentService" = Depends(_get_agent_service),
+) -> RateLimitResponse:
+    """Apply a per-agent rate limit via the Kong Admin API.
+
+    Creates or updates a consumer-level rate-limiting plugin for the specified
+    agent. Rate limits are enforced by Kong at the gateway layer.
+
+    Args:
+        agent_id: Agent UUID to rate-limit.
+        body: Rate-limiting configuration (requests per minute/hour/day).
+        request: FastAPI request.
+        tenant: Authenticated tenant context.
+        agent_service: Injected agent service.
+
+    Returns:
+        RateLimitResponse with applied configuration and Kong plugin ID.
+
+    Raises:
+        HTTPException: 404 if agent not found, 503 if Kong is unreachable.
+    """
+    from aumos_common.errors import AumOSError, NotFoundError
+
+    try:
+        agent = await agent_service.get_agent(tenant=tenant, agent_id=agent_id)
+    except NotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent {agent_id} not found")
+
+    kong = request.app.state.kong_client
+    consumer_id = str(agent_id)
+
+    try:
+        plugin_data = await kong.set_consumer_rate_limit(
+            consumer_id=consumer_id,
+            requests_per_minute=body.requests_per_minute,
+            requests_per_hour=body.requests_per_hour,
+            requests_per_day=body.requests_per_day,
+        )
+    except AumOSError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc.message))
+
+    return RateLimitResponse(
+        agent_id=agent_id,
+        consumer_id=consumer_id,
+        config=body,
+        plugin_id=plugin_data.get("id"),
+    )

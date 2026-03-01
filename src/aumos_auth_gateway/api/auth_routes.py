@@ -16,6 +16,8 @@ from aumos_auth_gateway.api.schemas import (
     OIDCDiscoveryResponse,
     RefreshTokenRequest,
     RevokeTokenRequest,
+    TokenExchangeRequest,
+    TokenExchangeResponse,
     TokenRequest,
     TokenResponse,
     UserInfoResponse,
@@ -206,6 +208,88 @@ async def get_userinfo(
                 headers={"WWW-Authenticate": "Bearer"},
             )
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc.message))
+
+
+@router.post(
+    "/token/exchange",
+    response_model=TokenExchangeResponse,
+    summary="RFC 8693 Token Exchange — K8s OIDC to AumOS JWT",
+    tags=["Authentication"],
+)
+async def exchange_token(
+    body: TokenExchangeRequest,
+    request: Request,
+) -> TokenExchangeResponse:
+    """Exchange a Kubernetes ServiceAccount token for an AumOS JWT (RFC 8693).
+
+    Validates the subject token via the Kubernetes TokenReview API, then exchanges
+    it for an AumOS JWT via Keycloak Token Exchange. Enables pods running in AumOS
+    tenant namespaces to authenticate without storing long-lived credentials.
+
+    Args:
+        body: Token exchange request with subject_token and optional audience/scope.
+        request: FastAPI request.
+
+    Returns:
+        TokenExchangeResponse with the issued AumOS access token.
+
+    Raises:
+        HTTPException: 401 if the subject token is invalid, 503 if dependencies
+            (Kubernetes API or Keycloak) are unreachable.
+    """
+    from aumos_common.errors import AumOSError, ErrorCode
+
+    settings = request.app.state.settings
+    keycloak = request.app.state.keycloak_client
+
+    # Step 1: Validate the K8s SA token via TokenReview API (if k8s_api_url configured)
+    k8s_api_url: str = getattr(settings, "k8s_api_url", "")
+    if k8s_api_url:
+        from aumos_auth_gateway.core.k8s_token_validator import K8sTokenValidator
+
+        validator = K8sTokenValidator(k8s_api_url=k8s_api_url)
+        try:
+            review_result = await validator.validate_token(token=body.subject_token)
+        except AumOSError as exc:
+            if exc.error_code == ErrorCode.SERVICE_UNAVAILABLE:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=str(exc.message),
+                )
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token validation failed")
+
+        if not review_result.authenticated:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Kubernetes ServiceAccount token is invalid or expired",
+            )
+
+    # Step 2: Exchange via Keycloak Token Exchange (RFC 8693)
+    exchange_client_id: str = getattr(settings, "token_exchange_client_id", settings.keycloak_audience)
+    exchange_client_secret: str = getattr(settings, "token_exchange_client_secret", "")
+
+    try:
+        token_data = await keycloak.exchange_token(
+            subject_token=body.subject_token,
+            subject_token_type=body.subject_token_type,
+            requested_token_type=body.requested_token_type,
+            client_id=exchange_client_id,
+            client_secret=exchange_client_secret,
+            audience=body.audience,
+            scope=body.scope,
+        )
+    except AumOSError as exc:
+        if exc.error_code == ErrorCode.SERVICE_UNAVAILABLE:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc.message))
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc.message))
+
+    return TokenExchangeResponse(
+        access_token=token_data.get("access_token", ""),
+        issued_token_type=token_data.get("issued_token_type", body.requested_token_type),
+        token_type=token_data.get("token_type", "Bearer"),
+        expires_in=token_data.get("expires_in", 300),
+        scope=token_data.get("scope"),
+    )
 
 
 @router.get(

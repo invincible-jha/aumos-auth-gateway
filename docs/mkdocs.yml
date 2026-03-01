@@ -1,0 +1,49 @@
+site_name: AumOS Auth Gateway
+site_description: Centralized authentication and authorization for the AumOS platform
+site_author: MuVeraAI Corporation
+repo_url: https://github.com/aumos/aumos-auth-gateway
+docs_dir: docs
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - toc.integrate
+    - search.suggest
+
+plugins:
+  - search
+  - mermaid2
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Architecture: architecture.md
+  - Quickstart: quickstart.md
+  - API Reference: api-reference.md
+  - Guides:
+      - Agent Identity: guides/agent-identity.md
+      - K8s OIDC Integration: guides/k8s-oidc.md
+      - Passkeys & FIDO2: guides/passkeys.md
+      - Rate Limiting: guides/rate-limiting.md
+      - Session Management: guides/session-management.md
+  - Helm Reference: helm-reference.md
+  - Troubleshooting: troubleshooting.md

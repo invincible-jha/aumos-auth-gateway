@@ -311,3 +311,357 @@ class TenantUserListResponse(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+# ---------------------------------------------------------------------------
+# Session management schemas (Gap #21)
+# ---------------------------------------------------------------------------
+
+
+class SessionResponse(BaseModel):
+    """An active Keycloak session for an authenticated user or agent.
+
+    Attributes:
+        session_id: Unique session identifier.
+        user_id: User or agent ID owning this session.
+        tenant_id: Tenant UUID the session belongs to.
+        client_id: Keycloak client ID for the session.
+        ip_address: Source IP address that initiated the session.
+        started_at: Session start timestamp (UTC ISO 8601).
+        last_access_at: Most recent activity timestamp (UTC ISO 8601).
+        expires_at: Session expiry timestamp (UTC ISO 8601).
+    """
+
+    session_id: str
+    user_id: str
+    tenant_id: uuid.UUID | None = None
+    client_id: str | None = None
+    ip_address: str | None = None
+    started_at: datetime
+    last_access_at: datetime
+    expires_at: datetime | None = None
+
+
+class SessionListResponse(BaseModel):
+    """Paginated list of active sessions.
+
+    Attributes:
+        items: List of SessionResponse objects.
+        total: Total number of matching sessions.
+        page: Current page number (1-based).
+        page_size: Results per page.
+    """
+
+    items: list[SessionResponse]
+    total: int
+    page: int
+    page_size: int
+
+
+class SessionTerminateRequest(BaseModel):
+    """Request to terminate one or more sessions.
+
+    Attributes:
+        session_ids: List of session IDs to terminate. Terminates all active
+            sessions for the tenant if empty.
+        reason: Optional audit reason for the termination.
+    """
+
+    session_ids: list[str] = []
+    reason: str | None = Field(default=None, max_length=500)
+
+
+# ---------------------------------------------------------------------------
+# Admin audit schemas (Gap #15)
+# ---------------------------------------------------------------------------
+
+
+class AuditEventResponse(BaseModel):
+    """A single audit log entry from the auth gateway.
+
+    Attributes:
+        id: Unique audit event UUID.
+        tenant_id: Tenant this event belongs to.
+        event_type: Type of event (e.g., auth.login, agent.created).
+        subject: User or agent that triggered the event.
+        resource: Target resource path or URN.
+        action: Action performed (read, write, delete).
+        outcome: Result of the action (success, failure, denied).
+        ip_address: Source IP address.
+        timestamp: Event timestamp (UTC ISO 8601).
+        metadata: Additional structured event metadata.
+    """
+
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    event_type: str
+    subject: str
+    resource: str | None = None
+    action: str | None = None
+    outcome: str
+    ip_address: str | None = None
+    timestamp: datetime
+    metadata: dict[str, Any] = {}
+
+
+class AuditEventListResponse(BaseModel):
+    """Paginated list of audit events.
+
+    Attributes:
+        items: List of AuditEventResponse objects.
+        total: Total number of matching events.
+        page: Current page number (1-based).
+        page_size: Results per page.
+    """
+
+    items: list[AuditEventResponse]
+    total: int
+    page: int
+    page_size: int
+
+
+# ---------------------------------------------------------------------------
+# Token exchange schemas (Gap #17)
+# ---------------------------------------------------------------------------
+
+
+class TokenExchangeRequest(BaseModel):
+    """RFC 8693 token exchange request.
+
+    Exchanges a Kubernetes ServiceAccount token (or other subject token)
+    for an AumOS JWT issued by Keycloak.
+
+    Attributes:
+        subject_token: The token to be exchanged (e.g., K8s SA JWT).
+        subject_token_type: Token type URN per RFC 8693.
+        requested_token_type: Desired output token type URN.
+        audience: Target service audience for the issued token.
+        scope: Requested OAuth2 scopes for the issued token.
+    """
+
+    subject_token: str = Field(description="Token to exchange (K8s SA JWT or other subject token)")
+    subject_token_type: str = Field(
+        default="urn:ietf:params:oauth:token-type:jwt",
+        description="Type of the subject_token per RFC 8693",
+    )
+    requested_token_type: str = Field(
+        default="urn:ietf:params:oauth:token-type:access_token",
+        description="Type of token to issue",
+    )
+    audience: str | None = Field(default=None, description="Target audience for the issued token")
+    scope: str | None = Field(default=None, description="Requested scopes for the issued token")
+
+
+class TokenExchangeResponse(BaseModel):
+    """RFC 8693 token exchange response.
+
+    Attributes:
+        access_token: Issued AumOS JWT access token.
+        issued_token_type: URN identifying the type of issued token.
+        token_type: Token scheme (always Bearer).
+        expires_in: Token validity in seconds.
+        scope: Granted OAuth2 scopes.
+        tenant_id: AumOS tenant UUID the token is scoped to.
+    """
+
+    access_token: str
+    issued_token_type: str = "urn:ietf:params:oauth:token-type:access_token"
+    token_type: str = "Bearer"
+    expires_in: int
+    scope: str | None = None
+    tenant_id: uuid.UUID | None = None
+
+
+# ---------------------------------------------------------------------------
+# Passkey / FIDO2 schemas (Gap #18)
+# ---------------------------------------------------------------------------
+
+
+class PasskeyPolicyConfig(BaseModel):
+    """WebAuthn/FIDO2 passkey policy configuration for a realm.
+
+    Attributes:
+        rp_entity_name: Relying party display name shown in browser dialogs.
+        rp_id: Relying party domain (must match the browser origin).
+        attestation_conveyance_preference: Attestation preference (none/indirect/direct/enterprise).
+        authenticator_attachment: Platform-specific authenticator binding (platform/cross-platform).
+        require_resident_key: Whether to require a discoverable credential.
+        user_verification_requirement: User verification policy (required/preferred/discouraged).
+        passkey_registration_required: Whether passkey registration is enforced for all users.
+    """
+
+    rp_entity_name: str = Field(default="AumOS", description="Relying party display name")
+    rp_id: str | None = Field(default=None, description="Relying party domain (e.g., aumos.ai)")
+    attestation_conveyance_preference: str = Field(
+        default="none",
+        description="Attestation preference: none | indirect | direct | enterprise",
+    )
+    authenticator_attachment: str = Field(
+        default="platform",
+        description="Authenticator attachment: platform | cross-platform",
+    )
+    require_resident_key: bool = Field(default=True, description="Require discoverable credential")
+    user_verification_requirement: str = Field(
+        default="required",
+        description="User verification: required | preferred | discouraged",
+    )
+    passkey_registration_required: bool = Field(
+        default=False,
+        description="Enforce passkey registration for all tenant users",
+    )
+
+
+class PasskeyPolicyResponse(BaseModel):
+    """Current passkey policy for a Keycloak realm.
+
+    Attributes:
+        realm: Realm name the policy applies to.
+        policy: PasskeyPolicyConfig containing the current policy settings.
+        enabled: Whether the WebAuthn authenticator is enabled for this realm.
+    """
+
+    realm: str
+    policy: PasskeyPolicyConfig
+    enabled: bool
+
+
+# ---------------------------------------------------------------------------
+# Social IdP schemas (Gap #20)
+# ---------------------------------------------------------------------------
+
+
+class SocialIdpConfig(BaseModel):
+    """Configuration for a social identity provider in Keycloak.
+
+    Attributes:
+        alias: Unique identifier for the IdP within the realm.
+        display_name: Human-readable display name shown on the login page.
+        provider_id: Keycloak provider type (google, github, microsoft, oidc, saml).
+        client_id: OAuth2 client ID registered with the social provider.
+        client_secret: OAuth2 client secret (write-only, never returned in responses).
+        enabled: Whether the IdP is enabled.
+        trust_email: Whether to trust email claims from this provider without verification.
+        first_broker_login_flow_alias: Auth flow for first-time broker logins.
+        config: Additional provider-specific configuration.
+    """
+
+    alias: str = Field(min_length=1, max_length=64, description="Unique IdP identifier in the realm")
+    display_name: str = Field(default="", description="Display name on login page")
+    provider_id: str = Field(description="Provider type: google | github | microsoft | oidc | saml")
+    client_id: str = Field(description="OAuth2 client ID from the social provider")
+    client_secret: str = Field(description="OAuth2 client secret (write-only)")
+    enabled: bool = Field(default=True)
+    trust_email: bool = Field(default=False, description="Trust email claims without verification")
+    first_broker_login_flow_alias: str = Field(
+        default="first broker login",
+        description="Auth flow used on first-time broker login",
+    )
+    config: dict[str, Any] = Field(default_factory=dict, description="Provider-specific extra config")
+
+
+class SocialIdpResponse(BaseModel):
+    """Social identity provider details (without secret).
+
+    Attributes:
+        alias: Unique IdP identifier.
+        display_name: Human-readable display name.
+        provider_id: Keycloak provider type.
+        client_id: OAuth2 client ID.
+        enabled: Whether the IdP is active.
+        trust_email: Whether email is trusted.
+    """
+
+    alias: str
+    display_name: str
+    provider_id: str
+    client_id: str
+    enabled: bool
+    trust_email: bool
+
+
+class SocialIdpListResponse(BaseModel):
+    """List of social identity providers configured for a realm.
+
+    Attributes:
+        items: List of SocialIdpResponse objects.
+        total: Total number of configured providers.
+    """
+
+    items: list[SocialIdpResponse]
+    total: int
+
+
+# ---------------------------------------------------------------------------
+# Privilege metrics schemas (Gap #19)
+# ---------------------------------------------------------------------------
+
+
+class PrivilegeDistributionEntry(BaseModel):
+    """Count of agents at a specific privilege level.
+
+    Attributes:
+        privilege_level: Agent privilege level (1-5).
+        level_name: Human-readable name for the privilege level.
+        count: Number of active agents at this privilege level.
+        hitl_required: Whether HITL gates are required at this level.
+    """
+
+    privilege_level: int
+    level_name: str
+    count: int
+    hitl_required: bool
+
+
+class PrivilegeMetricsResponse(BaseModel):
+    """Privilege-level distribution and audit metrics for a tenant.
+
+    Attributes:
+        tenant_id: Tenant UUID.
+        total_agents: Total active agent count across all levels.
+        distribution: Per-level breakdown of agent counts.
+        elevated_agent_count: Agents at privilege level >= 3.
+        hitl_required_count: Agents requiring human-in-the-loop approval.
+        last_privilege_change_at: Timestamp of the most recent privilege update.
+    """
+
+    tenant_id: uuid.UUID
+    total_agents: int
+    distribution: list[PrivilegeDistributionEntry]
+    elevated_agent_count: int
+    hitl_required_count: int
+    last_privilege_change_at: datetime | None = None
+
+
+# ---------------------------------------------------------------------------
+# Rate-limiting schemas (Gap #22)
+# ---------------------------------------------------------------------------
+
+
+class RateLimitConfig(BaseModel):
+    """Per-agent Kong rate-limiting configuration.
+
+    Attributes:
+        requests_per_minute: Maximum API requests per minute.
+        requests_per_hour: Optional maximum API requests per hour.
+        requests_per_day: Optional maximum API requests per day.
+    """
+
+    requests_per_minute: int = Field(ge=1, description="Maximum requests per minute")
+    requests_per_hour: int | None = Field(default=None, ge=1, description="Maximum requests per hour")
+    requests_per_day: int | None = Field(default=None, ge=1, description="Maximum requests per day")
+
+
+class RateLimitResponse(BaseModel):
+    """Response after applying a per-agent rate limit.
+
+    Attributes:
+        agent_id: Agent UUID the rate limit was applied to.
+        consumer_id: Kong consumer ID.
+        config: Applied rate-limiting configuration.
+        plugin_id: Kong plugin UUID for the created/updated rate-limit rule.
+    """
+
+    agent_id: uuid.UUID
+    consumer_id: str
+    config: RateLimitConfig
+    plugin_id: str | None = None

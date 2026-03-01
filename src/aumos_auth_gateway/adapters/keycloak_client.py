@@ -571,6 +571,286 @@ class KeycloakAdminClient:
         logger.info("Tenant role assigned", tenant_id=str(tenant_id), user_id=user_id, role=role)
 
     # ------------------------------------------------------------------
+    # Token exchange (Gap #17 — RFC 8693 K8s OIDC token exchange)
+    # ------------------------------------------------------------------
+
+    async def exchange_token(
+        self,
+        subject_token: str,
+        subject_token_type: str,
+        requested_token_type: str,
+        client_id: str,
+        client_secret: str,
+        audience: str | None = None,
+        scope: str | None = None,
+    ) -> dict[str, Any]:
+        """Exchange a subject token for an AumOS JWT via Keycloak Token Exchange (RFC 8693).
+
+        Used by the K8s OIDC integration to convert validated Kubernetes ServiceAccount
+        tokens into AumOS JWTs without storing long-lived credentials.
+
+        Args:
+            subject_token: The token to be exchanged (e.g., a K8s SA JWT).
+            subject_token_type: Token type URN per RFC 8693 (e.g., urn:ietf:params:oauth:token-type:jwt).
+            requested_token_type: Desired output type URN (e.g., urn:ietf:params:oauth:token-type:access_token).
+            client_id: Keycloak client authorized to perform token exchange.
+            client_secret: Client secret for the exchange client.
+            audience: Optional target audience for the issued token.
+            scope: Optional OAuth2 scopes to request on the issued token.
+
+        Returns:
+            Token exchange response dict with access_token, expires_in, and scope.
+
+        Raises:
+            AumOSError: If Keycloak is unreachable or the exchange fails.
+        """
+        token_url = f"/realms/{self._aumos_realm}/protocol/openid-connect/token"
+        form_data: dict[str, str] = {
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "subject_token": subject_token,
+            "subject_token_type": subject_token_type,
+            "requested_token_type": requested_token_type,
+        }
+        if audience:
+            form_data["audience"] = audience
+        if scope:
+            form_data["scope"] = scope
+
+        try:
+            response = await self._http.post(token_url, data=form_data)
+        except httpx.ConnectError as exc:
+            raise AumOSError(
+                message="Keycloak unreachable during token exchange",
+                error_code=ErrorCode.SERVICE_UNAVAILABLE,
+            ) from exc
+
+        if response.status_code == 401:
+            raise AumOSError(
+                message="Token exchange rejected — invalid subject token or unauthorized client",
+                error_code=ErrorCode.UNAUTHORIZED,
+            )
+        if response.status_code == 403:
+            raise AumOSError(
+                message="Token exchange forbidden — client not authorized for token exchange",
+                error_code=ErrorCode.FORBIDDEN,
+            )
+        if response.status_code != 200:
+            raise AumOSError(
+                message=f"Token exchange failed: {response.status_code} {response.text[:200]}",
+                error_code=ErrorCode.INTERNAL_ERROR,
+            )
+
+        result: dict[str, Any] = response.json()
+        logger.info("Token exchange successful", client_id=client_id, audience=audience)
+        return result
+
+    # ------------------------------------------------------------------
+    # WebAuthn / FIDO2 passkey policy (Gap #18)
+    # ------------------------------------------------------------------
+
+    async def get_webauthn_policy(self, realm: str) -> dict[str, Any]:
+        """Retrieve the WebAuthn authenticator policy for a Keycloak realm.
+
+        Args:
+            realm: Realm name to fetch the policy for.
+
+        Returns:
+            Dict containing webAuthnPolicyRpEntityName, webAuthnPolicyRpId,
+            webAuthnPolicyAttestationConveyancePreference, and related fields.
+
+        Raises:
+            AumOSError: If the request fails.
+        """
+        response = await self._admin_request("GET", f"/admin/realms/{realm}")
+        if response.status_code != 200:
+            raise AumOSError(
+                message=f"Failed to get realm config for passkey policy: {response.status_code}",
+                error_code=ErrorCode.INTERNAL_ERROR,
+            )
+        result: dict[str, Any] = response.json()
+        return result
+
+    async def set_webauthn_policy(self, realm: str, policy: dict[str, Any]) -> None:
+        """Update the WebAuthn authenticator policy for a Keycloak realm.
+
+        Args:
+            realm: Realm name to update.
+            policy: Partial realm representation with WebAuthn policy fields.
+                    Keycloak uses the top-level realm PUT to update webAuthnPolicy*.
+
+        Raises:
+            AumOSError: If the update fails.
+        """
+        response = await self._admin_request("PUT", f"/admin/realms/{realm}", json=policy)
+        if response.status_code not in (200, 204):
+            raise AumOSError(
+                message=f"Failed to update WebAuthn policy for realm '{realm}': {response.status_code}",
+                error_code=ErrorCode.INTERNAL_ERROR,
+            )
+        logger.info("WebAuthn policy updated", realm=realm)
+
+    # ------------------------------------------------------------------
+    # Social IdP management (Gap #20)
+    # ------------------------------------------------------------------
+
+    async def list_identity_providers(self, realm: str) -> list[dict[str, Any]]:
+        """List all identity providers configured in a Keycloak realm.
+
+        Args:
+            realm: Realm name to list IdPs from.
+
+        Returns:
+            List of identity provider representation dicts.
+
+        Raises:
+            AumOSError: If the request fails.
+        """
+        response = await self._admin_request("GET", f"/admin/realms/{realm}/identity-provider/instances")
+        if response.status_code != 200:
+            raise AumOSError(
+                message=f"Failed to list identity providers for realm '{realm}': {response.status_code}",
+                error_code=ErrorCode.INTERNAL_ERROR,
+            )
+        result: list[dict[str, Any]] = response.json()
+        return result
+
+    async def create_identity_provider(self, realm: str, provider: dict[str, Any]) -> dict[str, Any]:
+        """Register a new social identity provider in a Keycloak realm.
+
+        Args:
+            realm: Realm name.
+            provider: Identity provider representation dict with alias, providerId, config, etc.
+
+        Returns:
+            Created identity provider representation dict.
+
+        Raises:
+            AumOSError: If creation fails or a provider with the same alias already exists.
+        """
+        response = await self._admin_request(
+            "POST",
+            f"/admin/realms/{realm}/identity-provider/instances",
+            json=provider,
+        )
+        if response.status_code == 409:
+            raise AumOSError(
+                message=f"Identity provider '{provider.get('alias')}' already exists in realm '{realm}'",
+                error_code=ErrorCode.CONFLICT,
+            )
+        if response.status_code not in (200, 201):
+            raise AumOSError(
+                message=f"Failed to create identity provider: {response.status_code} {response.text[:200]}",
+                error_code=ErrorCode.INTERNAL_ERROR,
+            )
+        logger.info("Identity provider created", realm=realm, alias=provider.get("alias"))
+        created: dict[str, Any] = response.json() if response.content else provider
+        return created
+
+    async def delete_identity_provider(self, realm: str, alias: str) -> None:
+        """Remove a social identity provider from a Keycloak realm.
+
+        Args:
+            realm: Realm name.
+            alias: Identity provider alias to delete.
+
+        Raises:
+            AumOSError: If deletion fails (404 is silently ignored).
+        """
+        response = await self._admin_request(
+            "DELETE",
+            f"/admin/realms/{realm}/identity-provider/instances/{alias}",
+        )
+        if response.status_code not in (204, 404):
+            raise AumOSError(
+                message=f"Failed to delete identity provider '{alias}': {response.status_code}",
+                error_code=ErrorCode.INTERNAL_ERROR,
+            )
+        logger.info("Identity provider deleted", realm=realm, alias=alias)
+
+    # ------------------------------------------------------------------
+    # Session management (Gap #21)
+    # ------------------------------------------------------------------
+
+    async def list_sessions(
+        self,
+        realm: str,
+        client_id: str | None = None,
+        skip: int = 0,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """List active user sessions in a Keycloak realm.
+
+        Args:
+            realm: Realm name to query sessions from.
+            client_id: Optional client ID to filter sessions by.
+            skip: Offset for pagination.
+            limit: Maximum number of sessions to return.
+
+        Returns:
+            List of user session representation dicts.
+
+        Raises:
+            AumOSError: If the request fails.
+        """
+        if client_id:
+            path = f"/admin/realms/{realm}/clients/{client_id}/user-sessions?first={skip}&max={limit}"
+        else:
+            path = f"/admin/realms/{realm}/sessions/stats"
+
+        response = await self._admin_request("GET", path)
+        if response.status_code != 200:
+            raise AumOSError(
+                message=f"Failed to list sessions for realm '{realm}': {response.status_code}",
+                error_code=ErrorCode.INTERNAL_ERROR,
+            )
+        result: list[dict[str, Any]] = response.json() if isinstance(response.json(), list) else []
+        return result
+
+    async def delete_session(self, realm: str, session_id: str) -> None:
+        """Terminate a specific user session in Keycloak.
+
+        Args:
+            realm: Realm name.
+            session_id: Keycloak session UUID to terminate.
+
+        Raises:
+            AumOSError: If deletion fails (404 is silently ignored).
+        """
+        response = await self._admin_request(
+            "DELETE",
+            f"/admin/realms/{realm}/sessions/{session_id}",
+        )
+        if response.status_code not in (204, 404):
+            raise AumOSError(
+                message=f"Failed to terminate session '{session_id}': {response.status_code}",
+                error_code=ErrorCode.INTERNAL_ERROR,
+            )
+        logger.info("Session terminated", realm=realm, session_id=session_id)
+
+    async def delete_all_sessions_for_user(self, realm: str, user_id: str) -> None:
+        """Terminate all active sessions for a specific user.
+
+        Args:
+            realm: Realm name.
+            user_id: Keycloak user UUID whose sessions should be terminated.
+
+        Raises:
+            AumOSError: If deletion fails.
+        """
+        response = await self._admin_request(
+            "DELETE",
+            f"/admin/realms/{realm}/users/{user_id}/sessions",
+        )
+        if response.status_code not in (200, 204, 404):
+            raise AumOSError(
+                message=f"Failed to terminate sessions for user '{user_id}': {response.status_code}",
+                error_code=ErrorCode.INTERNAL_ERROR,
+            )
+        logger.info("All user sessions terminated", realm=realm, user_id=user_id)
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
